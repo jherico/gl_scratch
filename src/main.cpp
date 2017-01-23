@@ -44,7 +44,7 @@ using glm::quat;
 
 #include <Windows.h>
 
-static const size_t MAX_TEXTURES = 50;
+static const size_t MAX_TEXTURES = 16;
 
 
 static const double LOG_2 = log(2.0);
@@ -127,13 +127,13 @@ void main(void) {
 const char * FRAGMENT_SHADER = R"SHADER(
 #version 450 core
 
-uniform sampler2D tex;
+uniform sampler2DArray tex;
 
 in vec2 varTexCoord0;
 out vec4 outFragColor;
 
 void main(void) {
-    outFragColor = texture(tex, varTexCoord0);
+    outFragColor = texture(tex, vec3(varTexCoord0, 0));
 }
 
 )SHADER";
@@ -270,11 +270,9 @@ protected:
         glClearColor(1, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(10, 10, _size.x - 20, _size.y - 20);
-        if (_textures.size() && _textures.back() != _currentTexture) {
-            static size_t textureIndex = 0;
-            textureIndex = ++textureIndex % _textures.size();
-            _currentTexture = _textures[textureIndex];
-            glBindTexture(GL_TEXTURE_2D, _currentTexture);
+        if (0 != _texture) {
+            _currentTexture = _texture;
+            glBindTexture(GL_TEXTURE_2D_ARRAY, _texture);
         }
 
         if (_currentTexture) {
@@ -301,31 +299,34 @@ protected:
             });
             GLuint texture = 0;
             uint16_t mips = image.levels();
-            glCreateTextures(GL_TEXTURE_2D, 1, &texture);
-            _textures.push_back(texture);
-            glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, 0);
-            glTextureParameteri(texture, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(image.levels() - 1));
-            glTextureParameteri(texture, GL_TEXTURE_SPARSE_ARB, GL_TRUE);
-            glTextureParameteri(texture, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
-            glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTextureStorage2D(texture, mips, GL_RGBA8, extent.x, extent.y);
-            if (!maxSparseLevel) {
+            if (_textures.empty()) {
+                glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &texture);
+                glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, 0);
+                glTextureParameteri(texture, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(image.levels() - 1));
+                glTextureParameteri(texture, GL_TEXTURE_SPARSE_ARB, GL_TRUE);
+                glTextureParameteri(texture, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
+                glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTextureStorage3D(texture, mips, GL_RGBA8, extent.x, extent.y, MAX_TEXTURES);
                 glGetTextureParameterIuiv(texture, GL_NUM_SPARSE_LEVELS_ARB, &maxSparseLevel);
+                _texture = texture;
+            } else {
+                texture = _texture;
             }
+            GLuint layer = _textures.size();
+            _textures.push_back(layer);
             for (uint16_t mip = 0; mip < mips; ++mip) {
                 auto extent = image.extent(mip);
                 if (mip <= maxSparseLevel) {
-                    glTexturePageCommitmentEXT(texture, mip, 0, 0, 0, extent.x, extent.y, 1, GL_TRUE);
+                    glTexturePageCommitmentEXT(texture, mip, 0, 0, layer, extent.x, extent.y, 1, GL_TRUE);
                 }
-                glTextureSubImage2D(texture, mip, 0, 0, extent.x, extent.y, format.External, format.Type, image.data(0, 0, mip));
-                glGenerateTextureMipmap(texture);
+                glTextureSubImage3D(texture, mip, 0, 0, layer, extent.x, extent.y, 1, format.External, format.Type, image.data(0, 0, mip));
             }
         } else {
             finishedLoading = true;
             static std::once_flag once;
             std::call_once(once, [] {
-                OutputDebugString("Max \n");
+                std::cout << "Max";
                 glmem.update();
                 glmem.report();
             });
@@ -338,10 +339,8 @@ protected:
                     std::cout << "Reducing" << std::endl;
                     auto extent = image.extent(minMip);
                     std::cout << "Removing mip " << minMip << " with dimesions " << extent.x << " x " << extent.y << std::endl;
-                    for (auto texture : _textures) {
-                        glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, minMip + 1);
-                        glTexturePageCommitmentEXT(texture, minMip, 0, 0, 0, extent.x, extent.y, 1, GL_FALSE);
-                    }
+                    glTextureParameteri(_texture, GL_TEXTURE_BASE_LEVEL, minMip + 1);
+                    glTexturePageCommitmentEXT(_texture, minMip, 0, 0, 0, extent.x, extent.y, MAX_TEXTURES, GL_FALSE);
                     glFinish();
                     ++minMip;
                     lastTickCount = now;
@@ -363,6 +362,7 @@ protected:
 
 private:
     std::vector<GLuint> _textures;
+    GLuint _texture{ 0 };
     glm::uvec2 _size{ 800, 600 };
     double _textureTimer = -1;
     size_t _textureCount { 0 };
