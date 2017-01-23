@@ -1,4 +1,4 @@
-//
+﻿//
 //  Created by Bradley Austin Davis on 2016/07/01
 //  Copyright 2014 High Fidelity, Inc.
 //
@@ -44,8 +44,48 @@ using glm::quat;
 
 #include <Windows.h>
 
+static const size_t MAX_TEXTURES = 50;
+
+
 static const double LOG_2 = log(2.0);
 
+struct GLMem {
+    GLint dedicatedMemory;
+    GLint availableMemory;
+    GLint currentAvailableVidMem;
+    GLint evictionCount;
+    GLint evictedMemory;
+
+    void update() {
+#define GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX          0x9047
+#define GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX    0x9048
+#define GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX  0x9049
+#define GPU_MEMORY_INFO_EVICTION_COUNT_NVX            0x904A
+#define GPU_MEMORY_INFO_EVICTED_MEMORY_NVX            0x904B
+        glGetIntegerv(GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &dedicatedMemory);
+        glGetIntegerv(GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &availableMemory);
+        glGetIntegerv(GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &currentAvailableVidMem);
+        glGetIntegerv(GPU_MEMORY_INFO_EVICTION_COUNT_NVX, &evictionCount);
+        glGetIntegerv(GPU_MEMORY_INFO_EVICTED_MEMORY_NVX, &evictedMemory);
+    }
+
+    void report() {
+        static char buffer[8192];
+        //sprintf(
+        //    buffer,
+        //    "Dedicated: %u\n"
+        //    "Available: %u\n"
+        //    "Current:   %u\n"
+        //    "Eviction:  %u\n"
+        //    "Evicted:   %u\n",
+        //    dedicatedMemory, availableMemory, currentAvailableVidMem, evictionCount, evictedMemory);
+        auto used = availableMemory - currentAvailableVidMem;
+        sprintf(buffer, "Used: %u\n", used);
+        OutputDebugString(buffer);
+    }
+};
+
+            
 uint16_t evalNumMips(const uvec3& size) {
     double dim = glm::compMax(size);
     double val = log(dim) / LOG_2;
@@ -57,7 +97,6 @@ glm::uvec3 evalMipDimensions(const uvec3& size, uint16_t mip) {
     result >>= mip;
     return glm::max(result, uvec3(1));
 }
-
 
 void GLAPIENTRY debugMessageCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam) {
     if (GL_DEBUG_SEVERITY_NOTIFICATION == severity) {
@@ -178,13 +217,17 @@ public:
         glfwSetWindowUserPointer(window, this);
         glfwSetWindowCloseCallback(window, CloseHandler);
         glfwSetFramebufferSizeCallback(window, FramebufferSizeHandler);
+        glfwSetWindowPos(window, -800, 0);
         glfwShowWindow(window);
 
         glfwMakeContextCurrent(window);
         glewExperimental = true;
         glewInit();
         glDebugMessageCallback(debugMessageCallback, NULL);
+        glEnable(GL_DEBUG_OUTPUT);
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB);
+        static const char* TEST_MESSAGE = "Test Message";
+        glDebugMessageInsert(GL_DEBUG_SOURCE_OTHER, GL_DEBUG_TYPE_ERROR, 1, GL_DEBUG_SEVERITY_HIGH, strlen(TEST_MESSAGE), TEST_MESSAGE);
         glCreateVertexArrays(1, &_vao);
         glBindVertexArray(_vao);
         {
@@ -228,7 +271,9 @@ protected:
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(10, 10, _size.x - 20, _size.y - 20);
         if (_textures.size() && _textures.back() != _currentTexture) {
-            _currentTexture = _textures.back();
+            static size_t textureIndex = 0;
+            textureIndex = ++textureIndex % _textures.size();
+            _currentTexture = _textures[textureIndex];
             glBindTexture(GL_TEXTURE_2D, _currentTexture);
         }
 
@@ -239,13 +284,21 @@ protected:
 
     
     void uploadTexture() {
-        static const size_t MAX_TEXTURES = 1000;
+        static GLMem glmem;
         static std::once_flag once;
-        static gli::texture2d image(gli::load(PROJECT_ROOT"/test.dds"));
+        static gli::texture2d image(gli::flip(gli::texture2d(gli::load(PROJECT_ROOT"/test.dds"))));
         static const auto extent = image.extent();
         static gli::gl GL(gli::gl::PROFILE_GL33);
         static gli::gl::format const format = GL.translate(image.format(), image.swizzles());
-        if (_textures.size() < MAX_TEXTURES) {
+        static GLuint maxSparseLevel = 0;
+        static GLuint minMip = 0;
+        static bool finishedLoading = false;
+        if (!finishedLoading && _textures.size() < MAX_TEXTURES) {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                glmem.update();
+                glmem.report();
+            });
             GLuint texture = 0;
             uint16_t mips = image.levels();
             glCreateTextures(GL_TEXTURE_2D, 1, &texture);
@@ -257,66 +310,77 @@ protected:
             glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
             glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTextureStorage2D(texture, mips, GL_RGBA8, extent.x, extent.y);
-            GLuint maxSparseLevel;
-            glGetTextureParameterIuiv(texture, GL_NUM_SPARSE_LEVELS_ARB, &maxSparseLevel);
-            for (uint16_t mip = 0; mip < maxSparseLevel; ++mip) {
+            if (!maxSparseLevel) {
+                glGetTextureParameterIuiv(texture, GL_NUM_SPARSE_LEVELS_ARB, &maxSparseLevel);
+            }
+            for (uint16_t mip = 0; mip < mips; ++mip) {
                 auto extent = image.extent(mip);
-                glTexturePageCommitmentEXT(texture, mip, 0, 0, 0, extent.x, extent.y, 1, GL_TRUE);
+                if (mip <= maxSparseLevel) {
+                    glTexturePageCommitmentEXT(texture, mip, 0, 0, 0, extent.x, extent.y, 1, GL_TRUE);
+                }
                 glTextureSubImage2D(texture, mip, 0, 0, extent.x, extent.y, format.External, format.Type, image.data(0, 0, mip));
+                glGenerateTextureMipmap(texture);
+            }
+        } else {
+            finishedLoading = true;
+            static std::once_flag once;
+            std::call_once(once, [] {
+                OutputDebugString("Max \n");
+                glmem.update();
+                glmem.report();
+            });
+            static auto lastTickCount = GetTickCount();
+            auto now = GetTickCount();
+            auto elapsed = now - lastTickCount;
+            if (elapsed >= 500) {
+                if (minMip < maxSparseLevel) {
+                    glFinish();
+                    std::cout << "Reducing" << std::endl;
+                    auto extent = image.extent(minMip);
+                    std::cout << "Removing mip " << minMip << " with dimesions " << extent.x << " x " << extent.y << std::endl;
+                    for (auto texture : _textures) {
+                        glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, minMip + 1);
+                        glTexturePageCommitmentEXT(texture, minMip, 0, 0, 0, extent.x, extent.y, 1, GL_FALSE);
+                    }
+                    glFinish();
+                    ++minMip;
+                    lastTickCount = now;
+                    glmem.update();
+                    glmem.report();
+                } else if (_textures.size() > 1) {
+                //    OutputDebugString("Deleting \n");
+                //    std::cout << "Deleting texture " <<
+                //    glDeleteTextures(1, &(_textures.back()));
+                //    _textures.pop_back();
+                //    glmem.update();
+                //    glmem.report();
+                //} else {
+                //    int i = 0;
+                }
             }
         }
     }
 
 private:
-    glm::uvec2 _size { 800, 600 };
+    std::vector<GLuint> _textures;
+    glm::uvec2 _size{ 800, 600 };
     double _textureTimer = -1;
-    std::list<GLuint> _textures;
     size_t _textureCount { 0 };
     GLuint _currentTexture { 0 };
     GLuint _program { 0 };
     GLuint _vao { 0 };
 
     GLFWwindow* window { nullptr };
-    static void FramebufferSizeHandler(GLFWwindow* window, int width, int height);
-    static void CloseHandler(GLFWwindow* window);
-};
-
-
-
-void GlWindow::CloseHandler(GLFWwindow* window) {
-    GLFWwindow* example = (GLFWwindow*)glfwGetWindowUserPointer(window);
-    glfwSetWindowShouldClose(window, 1);
-}
-
-void GlWindow::FramebufferSizeHandler(GLFWwindow* window, int width, int height) {
-    GlWindow* example = (GlWindow*)glfwGetWindowUserPointer(window);
-    example->windowResize(glm::uvec2(width, height));
-}
-
-#if 0
-// Create a simple OpenGL window that renders text in various ways
-class QTestWindow : public QOpenGLWindow {
-public:
-
-protected:
-
-
-    void resizeGL(int w, int h) override {
-        glViewport(0, 0, w, h);
+    static void FramebufferSizeHandler(GLFWwindow* window, int width, int height) {
+        GlWindow* example = (GlWindow*)glfwGetWindowUserPointer(window);
+        example->windowResize(glm::uvec2(width, height));
     }
 
-    void paintGL() override {
-        glClearColor(1, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
+    static void CloseHandler(GLFWwindow* window) {
+        GLFWwindow* example = (GLFWwindow*)glfwGetWindowUserPointer(window);
+        glfwSetWindowShouldClose(window, 1);
     }
 };
-
-const uvec3 QTestWindow::TEXTURE_SIZE{ 512, 512, 1 };
-
-const char * LOG_FILTER_RULES = R"V0G0N(
-hifi.gpu=true
-)V0G0N";
-#endif
 
 int main(int argc, char** argv) {
     GlWindow().run();
