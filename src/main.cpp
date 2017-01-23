@@ -44,8 +44,7 @@ using glm::quat;
 
 #include <Windows.h>
 
-static const size_t MAX_TEXTURES = 50;
-
+static const size_t MAX_TEXTURES = 100;
 
 static const double LOG_2 = log(2.0);
 
@@ -70,22 +69,11 @@ struct GLMem {
     }
 
     void report() {
-        static char buffer[8192];
-        //sprintf(
-        //    buffer,
-        //    "Dedicated: %u\n"
-        //    "Available: %u\n"
-        //    "Current:   %u\n"
-        //    "Eviction:  %u\n"
-        //    "Evicted:   %u\n",
-        //    dedicatedMemory, availableMemory, currentAvailableVidMem, evictionCount, evictedMemory);
         auto used = availableMemory - currentAvailableVidMem;
-        sprintf(buffer, "Used: %u\n", used);
-        OutputDebugString(buffer);
+        std::cout << "Used " << used << std::endl;
     }
 };
 
-            
 uint16_t evalNumMips(const uvec3& size) {
     double dim = glm::compMax(size);
     double val = log(dim) / LOG_2;
@@ -227,7 +215,6 @@ public:
         glEnable(GL_DEBUG_OUTPUT);
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB);
         static const char* TEST_MESSAGE = "Test Message";
-        glDebugMessageInsert(GL_DEBUG_SOURCE_OTHER, GL_DEBUG_TYPE_ERROR, 1, GL_DEBUG_SEVERITY_HIGH, strlen(TEST_MESSAGE), TEST_MESSAGE);
         glCreateVertexArrays(1, &_vao);
         glBindVertexArray(_vao);
         {
@@ -325,7 +312,7 @@ protected:
             finishedLoading = true;
             static std::once_flag once;
             std::call_once(once, [] {
-                OutputDebugString("Max \n");
+                std::cout << "Max" << std::endl;
                 glmem.update();
                 glmem.report();
             });
@@ -334,29 +321,26 @@ protected:
             auto elapsed = now - lastTickCount;
             if (elapsed >= 500) {
                 if (minMip < maxSparseLevel) {
-                    glFinish();
-                    std::cout << "Reducing" << std::endl;
                     auto extent = image.extent(minMip);
                     std::cout << "Removing mip " << minMip << " with dimesions " << extent.x << " x " << extent.y << std::endl;
                     for (auto texture : _textures) {
                         glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, minMip + 1);
                         glTexturePageCommitmentEXT(texture, minMip, 0, 0, 0, extent.x, extent.y, 1, GL_FALSE);
                     }
-                    glFinish();
                     ++minMip;
                     lastTickCount = now;
                     glmem.update();
                     glmem.report();
-                } else if (_textures.size() > 1) {
-                //    OutputDebugString("Deleting \n");
-                //    std::cout << "Deleting texture " <<
-                //    glDeleteTextures(1, &(_textures.back()));
-                //    _textures.pop_back();
-                //    glmem.update();
-                //    glmem.report();
-                //} else {
-                //    int i = 0;
+                } 
+#if 0
+                else if (_textures.size() == MAX_TEXTURES) {
+                    std::cout << "Deleting texture " << _textures.back() << std::endl;
+                    glDeleteTextures(1, &(_textures.back()));
+                    _textures.pop_back();
+                    glmem.update();
+                    glmem.report();
                 }
+#endif
             }
         }
     }
