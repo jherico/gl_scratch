@@ -57,16 +57,20 @@ const char * FRAGMENT_SHADER = R"SHADER(
 in vec2 varTexCoord0;
 out vec4 outFragColor;
 
-layout(binding = 0) uniform Material
-{
-	uvec2 diffuse;
-} material;
+struct MaterialDescriptor {
+    uvec4 handleAndMipRange;
+    vec4 uvScale;
+};
+
+layout(binding = 0) uniform materialBuffer  {
+	MaterialDescriptor material;
+};
 
 void main(void) {
-    sampler2DArray sampler = sampler2DArray(material.diffuse);
+    sampler2DArray sampler = sampler2DArray(material.handleAndMipRange.xy);
     vec3 texCoord0 = vec3(varTexCoord0, 0);
-    float mipmapLevel = textureQueryLod(sampler, texCoord0.xy).x;
-    outFragColor = textureLod(sampler, texCoord0, mipmapLevel);
+    float mipmapLevel = textureQueryLod(sampler, texCoord0.xy * material.uvScale.xy).x;
+    outFragColor = textureLod(sampler, texCoord0 * material.uvScale.xyz, mipmapLevel);
 }
 
 )SHADER";
@@ -103,8 +107,6 @@ static std::vector<uvec3> getPageDimensionsForFormat(GLenum target, GLenum forma
 struct MaterialDescriptor {
     uvec4 handleAndMipRange;
     vec4 uvScale;
-
-
 };
 
 class TestWindow : public GlWindow {
@@ -126,8 +128,7 @@ protected:
             _program = compileProgram(shaders);
         }
         glUseProgram(_program);
-        glCreateBuffers(1, &_materialBuffer);
-        glNamedBufferStorage(_materialBuffer, sizeof(GLuint64), nullptr, GL_DYNAMIC_STORAGE_BIT);
+
         glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &_textureArray);
 #if SPARSE
         glTextureParameteri(_textureArray, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
@@ -138,7 +139,7 @@ protected:
         auto pageSizes = getPageDimensionsForFormat(GL_TEXTURE_2D_ARRAY, imageFormat.Internal);
 
         auto pageSize = pageSizes[0];
-        auto arraySize = uvec3({ 4096, 4096, 2 });
+        auto arraySize = uvec3({ 4096, 4096, 2048 });
         auto arrayMips = evalNumMips(arraySize);
         glTextureStorage3D(_textureArray, arrayMips, GL_RGBA8, arraySize.x, arraySize.y, arraySize.z);
         glGetTextureParameterIuiv(_textureArray, GL_NUM_SPARSE_LEVELS_ARB, &_maxSparseLevel);
@@ -160,6 +161,15 @@ protected:
             glTextureSubImage3D(_textureArray, mip, 0, 0, 0, extent.x, extent.y, 1, imageFormat.External, imageFormat.Type, image->data(0, 0, mip));
         }
         glGenerateTextureMipmap(_textureArray);
+
+        memcpy(&_loadedTextureDescriptor.handleAndMipRange, &_textureHandle, sizeof(_textureHandle));
+        _loadedTextureDescriptor.handleAndMipRange.z = 0;
+        _loadedTextureDescriptor.handleAndMipRange.w = mips;
+        _loadedTextureDescriptor.uvScale = vec4(vec2(imageExtent) / vec2(arraySize), 1, 1);
+
+        glCreateBuffers(1, &_materialBuffer);
+        glNamedBufferStorage(_materialBuffer, sizeof(MaterialDescriptor), &_loadedTextureDescriptor, GL_DYNAMIC_STORAGE_BIT);
+        //glNamedBufferSubData(_materialBuffer, 0, sizeof(MaterialDescriptor), );
     }
 
     void update(double time, double interval) override {
@@ -169,7 +179,6 @@ protected:
         glClearColor(1, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(10, 10, _size.x - 20, _size.y - 20);
-        glNamedBufferSubData(_materialBuffer, 0, sizeof(GLuint64), &_textureHandle);
         glBindBufferBase(GL_UNIFORM_BUFFER, 0, _materialBuffer);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
@@ -180,6 +189,7 @@ private:
     GLuint _textureArray { 0 };
     GLuint64 _textureHandle { 0 };
     uvec3 _textureArraySize;
+    MaterialDescriptor _loadedTextureDescriptor;
     std::unordered_map<GLuint, GLuint64> _textureHandles;
     double _textureTimer = -1;
     size_t _textureCount { 0 };
@@ -190,7 +200,8 @@ private:
     GLuint _maxSparseLevel { 0 };
 
     std::shared_ptr<gli::texture2d> image;
-    gli::texture2d::extent_type imageExtent;
+    glm::uvec2 imageExtent;
+
     gli::gl::format imageFormat;
 };
 
