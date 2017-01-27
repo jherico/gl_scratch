@@ -6,78 +6,14 @@
 //  See the accompanying file LICENSE or http://www.apache.org/licenses/LICENSE-2.0.html
 //
 
-#include <iostream>
-#include <string>
-#include <vector>
-#include <list>
-#include <sstream>
-#include <unordered_map>
-#include <mutex>
-
-#include <GL/glew.h>
-
-#include <glm/gtx/component_wise.hpp>
-#include <glm/glm.hpp>
-#include <glm/gtc/quaternion.hpp>
-#include <glm/gtx/quaternion.hpp>
-
-#include "shaders.h"
-
-// Bring the most commonly used GLM types into the default namespace
-using glm::ivec2;
-using glm::ivec3;
-using glm::ivec4;
-using glm::uvec2;
-using glm::uvec3;
-using glm::uvec4;
-using glm::mat3;
-using glm::mat4;
-using glm::vec2;
-using glm::vec3;
-using glm::vec4;
-using glm::quat;
-
-#include <gli/gli.hpp>
-#include <gli/convert.hpp>
-#include <gli/generate_mipmaps.hpp>
-#include <gli/load.hpp>
-#include <gli/save.hpp>
-
-#include <GLFW/glfw3.h>
-
-#include <Windows.h>
+#include "Common.h"
+#include "GlWindow.h"
+#include "GlShaders.h"
 
 static const size_t MAX_TEXTURES = 64;
-
 static const double LOG_2 = log(2.0);
 
-#define SPARSE 0
-
-struct GLMem {
-    GLint dedicatedMemory;
-    GLint availableMemory;
-    GLint currentAvailableVidMem;
-    GLint evictionCount;
-    GLint evictedMemory;
-
-    void update() {
-#define GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX          0x9047
-#define GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX    0x9048
-#define GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX  0x9049
-#define GPU_MEMORY_INFO_EVICTION_COUNT_NVX            0x904A
-#define GPU_MEMORY_INFO_EVICTED_MEMORY_NVX            0x904B
-        glGetIntegerv(GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &dedicatedMemory);
-        glGetIntegerv(GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &availableMemory);
-        glGetIntegerv(GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &currentAvailableVidMem);
-        glGetIntegerv(GPU_MEMORY_INFO_EVICTION_COUNT_NVX, &evictionCount);
-        glGetIntegerv(GPU_MEMORY_INFO_EVICTED_MEMORY_NVX, &evictedMemory);
-    }
-
-    void report() {
-        auto used = availableMemory - currentAvailableVidMem;
-        std::cout << "Used " << used << std::endl;
-    }
-};
+#define SPARSE 1
 
 uint16_t evalNumMips(const uvec3& size) {
     double dim = glm::compMax(size);
@@ -91,16 +27,12 @@ glm::uvec3 evalMipDimensions(const uvec3& size, uint16_t mip) {
     return glm::max(result, uvec3(1));
 }
 
-void GLAPIENTRY debugMessageCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam) {
-    if (GL_DEBUG_SEVERITY_NOTIFICATION == severity) {
-        return;
-    }
-    OutputDebugStringA(message);
-    OutputDebugStringA("\n");
-}
 
 const char * VERTEX_SHADER = R"SHADER(
 #version 450 core
+
+layout(location = 0) uniform mat4 projection = mat4(1.0);
+layout(location = 4) uniform mat4 modelView = mat4(1.0);
 
 out vec2 varTexCoord0;
 
@@ -112,6 +44,7 @@ void main(void) {
         vec4(1.0, 1.0, 0.0, 1.0)
     );
     vec4 pos = UNIT_QUAD[gl_VertexID];
+    //gl_Position = projection * modelView * pos;
     gl_Position = pos;
     varTexCoord0 = (pos.xy + 1) * 0.5;
 }
@@ -130,39 +63,59 @@ layout(binding = 0) uniform Material
 } material;
 
 void main(void) {
-    outFragColor = texture(sampler2D(material.diffuse), varTexCoord0);
+    sampler2DArray sampler = sampler2DArray(material.diffuse);
+    vec3 texCoord0 = vec3(varTexCoord0, 0);
+    float mipmapLevel = textureQueryLod(sampler, texCoord0.xy).x;
+    outFragColor = textureLod(sampler, texCoord0, mipmapLevel);
 }
 
 )SHADER";
 
+using TextureTypeFormat = std::pair<GLenum, GLenum>;
 
+static std::vector<uvec3> getPageDimensionsForFormat(const TextureTypeFormat& typeFormat) {
+    GLint count = 0;
+    glGetInternalformativ(typeFormat.first, typeFormat.second, GL_NUM_VIRTUAL_PAGE_SIZES_ARB, 1, &count);
 
-class GlWindow {
-public:
-    GlWindow() {
-        glfwInit();
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-        glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);
-        window = glfwCreateWindow(_size.x, _size.y, "Window Title", NULL, NULL);
-        if (!window) {
-            glfwTerminate();
-            throw std::runtime_error("Could not create window");
+    std::vector<uvec3> result;
+    if (count > 0) {
+        std::vector<GLint> x, y, z;
+        x.resize(count);
+        glGetInternalformativ(typeFormat.first, typeFormat.second, GL_VIRTUAL_PAGE_SIZE_X_ARB, 1, &x[0]);
+        y.resize(count);
+        glGetInternalformativ(typeFormat.first, typeFormat.second, GL_VIRTUAL_PAGE_SIZE_Y_ARB, 1, &y[0]);
+        z.resize(count);
+        glGetInternalformativ(typeFormat.first, typeFormat.second, GL_VIRTUAL_PAGE_SIZE_Z_ARB, 1, &z[0]);
+
+        result.resize(count);
+        for (GLint i = 0; i < count; ++i) {
+            result[i] = uvec3(x[i], y[i], z[i]);
         }
-        glfwSetWindowUserPointer(window, this);
-        glfwSetWindowCloseCallback(window, CloseHandler);
-        glfwSetFramebufferSizeCallback(window, FramebufferSizeHandler);
-        glfwSetWindowPos(window, -800, 0);
-        glfwShowWindow(window);
+    }
 
-        glfwMakeContextCurrent(window);
-        glewExperimental = true;
-        glewInit();
-        glDebugMessageCallback(debugMessageCallback, NULL);
-        glEnable(GL_DEBUG_OUTPUT);
-        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_ARB);
-        static const char* TEST_MESSAGE = "Test Message";
+    return result;
+}
+
+static std::vector<uvec3> getPageDimensionsForFormat(GLenum target, GLenum format) {
+    return getPageDimensionsForFormat({ target, format });
+}
+
+struct MaterialDescriptor {
+    uvec4 handleAndMipRange;
+    vec4 uvScale;
+
+
+};
+
+class TestWindow : public GlWindow {
+protected:
+
+    void init() override {
+        image = std::make_shared<gli::texture2d>(gli::flip(gli::texture2d(gli::load(PROJECT_ROOT"/test.dds"))));
+        imageExtent = image->extent();
+        gli::gl GL(gli::gl::PROFILE_GL33);
+        imageFormat = GL.translate(image->format(), image->swizzles());
+
         glCreateVertexArrays(1, &_vao);
         glBindVertexArray(_vao);
         {
@@ -173,137 +126,75 @@ public:
             _program = compileProgram(shaders);
         }
         glUseProgram(_program);
-
         glCreateBuffers(1, &_materialBuffer);
         glNamedBufferStorage(_materialBuffer, sizeof(GLuint64), nullptr, GL_DYNAMIC_STORAGE_BIT);
-    }
+        glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &_textureArray);
+#if SPARSE
+        glTextureParameteri(_textureArray, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
+        glTextureParameteri(_textureArray, GL_TEXTURE_SPARSE_ARB, GL_TRUE);
+#endif
+        glTextureParameteri(_textureArray, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri(_textureArray, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        auto pageSizes = getPageDimensionsForFormat(GL_TEXTURE_2D_ARRAY, imageFormat.Internal);
 
-    virtual void run() {
+        auto pageSize = pageSizes[0];
+        auto arraySize = uvec3({ 4096, 4096, 2 });
+        auto arrayMips = evalNumMips(arraySize);
+        glTextureStorage3D(_textureArray, arrayMips, GL_RGBA8, arraySize.x, arraySize.y, arraySize.z);
+        glGetTextureParameterIuiv(_textureArray, GL_NUM_SPARSE_LEVELS_ARB, &_maxSparseLevel);
+        _textureHandle = glGetTextureHandleARB(_textureArray);
+        glMakeTextureHandleResidentARB(_textureHandle);
 
-        while (!glfwWindowShouldClose(window)) {
-            glfwPollEvents();
-            update();
-            draw();
-            glfwSwapBuffers(window);
+        // Load up the image into the first layer
+        uint16_t mips = (uint16_t)image->levels();
+        for (uint16_t mip = 0; mip < mips; ++mip) {
+            auto extent = image->extent(mip);
+#if SPARSE
+            if (extent.x < pageSize.x || extent.y < pageSize.y) {
+                break;
+            }
+            if (mip <= _maxSparseLevel) {
+                glTexturePageCommitmentEXT(_textureArray, mip, 0, 0, 0, extent.x, extent.y, 1, GL_TRUE);
+            }
+#endif
+            glTextureSubImage3D(_textureArray, mip, 0, 0, 0, extent.x, extent.y, 1, imageFormat.External, imageFormat.Type, image->data(0, 0, mip));
         }
-        glfwTerminate();
+        glGenerateTextureMipmap(_textureArray);
     }
 
-protected:
-
-    virtual void windowResize(const uvec2& size) {
-        _size = size;
+    void update(double time, double interval) override {
     }
 
-    virtual void update() {
-        double now = glfwGetTime();
-        double delta = now - _textureTimer;
-        if (_textureTimer < 0 || delta > 0.1) {
-            uploadTexture();
-            _textureTimer = now;
-        }
-    }
-
-    virtual void draw() {
+    void draw() override {
         glClearColor(1, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         glViewport(10, 10, _size.x - 20, _size.y - 20);
-        if (_textures.size()) {
-            if (_currentTexture) {
-                glMakeTextureHandleNonResidentARB(_textureHandles[_currentTexture]);
-                _currentTexture = 0;
-            }
-
-            static size_t textureIndex = 0;
-            textureIndex = ++textureIndex % _textures.size();
-            _currentTexture = _textures[textureIndex];
-            auto textureHandle = _textureHandles[_currentTexture];
-            glMakeTextureHandleResidentARB(textureHandle);
-            glNamedBufferSubData(_materialBuffer, 0, sizeof(GLuint64), &textureHandle);
-            glBindBufferBase(GL_UNIFORM_BUFFER, 0, _materialBuffer);
-            glBindTexture(GL_TEXTURE_2D, _currentTexture);
-        }
-
-        if (_currentTexture) {
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        }
+        glNamedBufferSubData(_materialBuffer, 0, sizeof(GLuint64), &_textureHandle);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, _materialBuffer);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
 
     
-    void uploadTexture() {
-        static GLMem glmem;
-        static std::once_flag once;
-        static gli::texture2d image(gli::flip(gli::texture2d(gli::load(PROJECT_ROOT"/test.dds"))));
-        static const auto extent = image.extent();
-        static gli::gl GL(gli::gl::PROFILE_GL33);
-        static gli::gl::format const format = GL.translate(image.format(), image.swizzles());
-        static GLuint maxSparseLevel = 0;
-        static GLuint minMip = 0;
-        static bool finishedLoading = false;
-        if (!finishedLoading && _textures.size() < MAX_TEXTURES) {
-            static std::once_flag once;
-            std::call_once(once, [] {
-                glmem.update();
-                glmem.report();
-            });
-            GLuint texture = 0;
-            uint16_t mips = image.levels();
-            glCreateTextures(GL_TEXTURE_2D, 1, &texture);
-            glTextureParameteri(texture, GL_TEXTURE_BASE_LEVEL, 0);
-            glTextureParameteri(texture, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(image.levels() - 1));
-            glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-#if SPARSE
-            glTextureParameteri(texture, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
-            glTextureParameteri(texture, GL_TEXTURE_SPARSE_ARB, GL_TRUE);
-#endif
-            glTextureStorage2D(texture, mips, GL_RGBA8, extent.x, extent.y);
-#if SPARSE
-            if (!maxSparseLevel) {
-                glGetTextureParameterIuiv(texture, GL_NUM_SPARSE_LEVELS_ARB, &maxSparseLevel);
-            }
-#endif
-            for (uint16_t mip = 0; mip < mips; ++mip) {
-                auto extent = image.extent(mip);
-#if SPARSE
-                if (mip <= maxSparseLevel) {
-                    glTexturePageCommitmentEXT(texture, mip, 0, 0, 0, extent.x, extent.y, 1, GL_TRUE);
-                }
-#endif
-                glTextureSubImage2D(texture, mip, 0, 0, extent.x, extent.y, format.External, format.Type, image.data(0, 0, mip));
-            }
-
-            glGenerateTextureMipmap(texture);
-            _textures.push_back(texture);
-            auto handle = glGetTextureHandleARB(texture);
-            _textureHandles[texture] = handle;
-        } 
-    }
 
 private:
-    std::vector<GLuint> _textures;
+    GLuint _textureArray { 0 };
+    GLuint64 _textureHandle { 0 };
+    uvec3 _textureArraySize;
     std::unordered_map<GLuint, GLuint64> _textureHandles;
-    glm::uvec2 _size{ 800, 600 };
     double _textureTimer = -1;
     size_t _textureCount { 0 };
     GLuint _materialBuffer { 0 };
     GLuint _currentTexture { 0 };
     GLuint _program { 0 };
     GLuint _vao { 0 };
+    GLuint _maxSparseLevel { 0 };
 
-    GLFWwindow* window { nullptr };
-    static void FramebufferSizeHandler(GLFWwindow* window, int width, int height) {
-        GlWindow* example = (GlWindow*)glfwGetWindowUserPointer(window);
-        example->windowResize(glm::uvec2(width, height));
-    }
-
-    static void CloseHandler(GLFWwindow* window) {
-        GLFWwindow* example = (GLFWwindow*)glfwGetWindowUserPointer(window);
-        glfwSetWindowShouldClose(window, 1);
-    }
+    std::shared_ptr<gli::texture2d> image;
+    gli::texture2d::extent_type imageExtent;
+    gli::gl::format imageFormat;
 };
 
 int main(int argc, char** argv) {
-    GlWindow().run();
+    TestWindow().run();
     return 0;
 }
